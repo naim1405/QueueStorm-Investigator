@@ -6,3 +6,5 @@ dist
 secret
 
 src/generated/prisma
+
+temp

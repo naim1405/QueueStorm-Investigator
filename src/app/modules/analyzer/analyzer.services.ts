@@ -353,14 +353,14 @@ export const analyzerService = async (body: any) => {
     transaction_history: body.transaction_history ?? [],
     metadata: body.metadata ?? {},
   };
-  console.log("LLMResponse:", requestMessage);
+//   console.log("LLMResponse:", requestMessage);
 
   const LLMResponse = await generateAIText({
     system: systemPrompt,
     prompt: JSON.stringify(requestMessage),
   });
 
-  console.log("LLMResponse:", LLMResponse);
+//   console.log("LLMResponse:", LLMResponse);
 
   const decodedResponse = JSON.parse(
   LLMResponse.replace(/```json|```/g, "").trim()
