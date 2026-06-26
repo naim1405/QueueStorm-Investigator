@@ -18,7 +18,7 @@ The service takes a customer complaint, together with the customer's recent tran
 - 📈 **Horizontally scalable AI throughput** — drop in more `GEMINI_API_KEY` env vars to scale; no code changes required.
 - 🛡️ **Hard-coded safety rails** — refuses to promise refunds, never solicits OTP/PIN/CVV, escalates fraud and phishing automatically.
 - 🧱 **Production-ready plumbing** — Helmet, CORS allow-list, rate limiting, request logging (Winston), Prometheus metrics, `/health`, graceful shutdown.
-- 🐳 **Docker** for the Redis broker (the app runs locally via `npm run dev`).
+| 🐳 **Docker** for the Redis broker (the app runs locally via `npm run dev`).
 
 ---
 
@@ -415,9 +415,60 @@ npm run format
 7. **No cost telemetry** — token usage is not recorded. Add usage tracking via the AI SDK's `usage` callback if you need per-ticket billing or quota dashboards.
 8. **Single-language routing** — `customer_reply` is generated in the model's preferred style, not guaranteed in the customer's `language`. Add an explicit "respond in the customer's language" rule to the prompt if this matters.
 9. **`/metrics` is unauthenticated** — Prometheus scraping is expected to happen from inside a trusted network.
-10. **Dead-key detection is heuristic** — the worker greps the error message for `denied access` / `api key not valid` / `invalid api key` / `project has been`. Any wording Gemini doesn't match will keep retrying on a key that should be skipped. Review the regex in `runBatchForSlot` if Gemini changes its error vocabulary.
+10. **Dead-key detection is heuristic** — the worker greps the error message for `denied access` / `api key not valid` / `invalid api key` / `project has been` / `api[_ ]?disabled` / `permission[_ ]?denied` / `forbidden` / `quota exceeded` / `resource_exhausted`. Any wording Gemini doesn't match will keep retrying on a key that should be skipped. Review the regex in `runBatchForSlot` if Gemini changes its error vocabulary.
 11. **Pub/sub subscriber connections are not tracked** — each ticket's `waitForAnalyzerJob` opens a short-lived Redis subscriber connection that self-closes on result/timeout. Long-running idle subscribers are not currently an issue, but a memory accounting layer is not built.
 12. **Result stash has no TTL cleanup** — `analyzer:results` accumulates `HSET` entries that are removed on read. A crashed subscriber that never reads its ticket would leak one entry until manual `FLUSHDB` or restart.
+
+---
+
+## � Operational Notes — Gemini API Key Failures
+
+Under heavy or rapid sequential testing, the Gemini API can **disable or rate-limit our API keys** even though the service code itself is healthy. Two distinct failure modes are observed in production-shaped testing:
+
+### 1. Free-tier quota exhaustion (transient, project-wide)
+
+When the aggregate request rate across the project exceeds Google's free-tier allowance for `gemini-2.5-flash` (default `20` requests/min for `generativelanguage.googleapis.com/generate_content_free_tier_requests`), Gemini returns:
+
+```
+AI_APICallError: You exceeded your current quota, please check your plan and billing details.
+* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests,
+  limit: 20, model: gemini-2.5-flash
+Please retry in 53.351608417s.
+```
+
+**Important caveat:** this quota is enforced **per Google Cloud project**, not per API key. Rotating between multiple `GEMINI_API_KEY*` values that all live under the same GCP project does **not** multiply the quota — every key shares the same `20 req/min` budget. The per-key sliding-window counter in `src/queue/keys.ts` (default `QUEUE_CALLS_PER_MIN_PER_KEY=5`) is therefore stricter than the upstream limit and is the binding constraint in practice.
+
+**Effect on this service:** the worker treats `Quota exceeded` / `Resource exhausted` as a permanent key error (`isPermanentKeyError` in `src/queue/analyzerWorker.ts`), marks the slot dead for `QUEUE_DEAD_KEY_COOLDOWN_MS` (default `10 min`), and reroutes in-flight jobs to another live slot. Because every key shares the quota, the second slot usually trips the same way within seconds, and requests then fail with `AI batch failed after N attempts`. **This is correct behaviour given the current key setup — there is no remaining live key.**
+
+**Mitigations without code changes:**
+
+- **Slow the burst.** The HTTP client submits one ticket per request; under sequential load, raise `QUEUE_BUFFER_MS` (default `1200`ms) so the worker batches more aggressively and burns fewer round-trips.
+- **Lower the per-key budget** further via `QUEUE_CALLS_PER_MIN_PER_KEY` (e.g. `2`) so the worker never trips the `20/min` upstream ceiling even when several keys are dead. Note: this is a *ceiling*, not a guarantee.
+- **Wait it out.** Quota resets on a per-minute rolling window. Errors self-resolve within ~60s of stopping traffic.
+- **Move to a paid tier** or distribute keys across **separate Google Cloud projects** to actually get N× the quota. Per-key failover only works if each key belongs to a different project.
+
+### 2. Key disabled / banned / revoked (permanent)
+
+After repeated quota violations, suspicious patterns, or account-level policy triggers, Google may **disable the API key entirely**. Symptom messages include `API has been disabled`, `API_KEY_INVALID`, `PERMISSION_DENIED`, `403 Forbidden`, `project has been`, or `key has been disabled by admin`. The worker greps for these in `isPermanentKeyError`, marks the slot dead for the cooldown window, and reroutes in-flight jobs to a surviving slot. If no other key is alive, the affected tickets fail out with `All API keys unavailable`.
+
+**Recovering a disabled key is an account-level action**, not a service-level one. Steps:
+
+1. Open [Google AI Studio / Google Cloud Console](https://aistudio.google.com/) → API keys.
+2. Check the disabled key's status — Google typically lists the reason and (sometimes) a one-click "Restore" action.
+3. If restore isn't offered, generate a new key, set `GEMINI_API_KEYn=<new-key>` in `.env.prod`, and restart the service.
+4. Confirm via `redis-cli GET analyzer:key:N:dead` — if empty for all slots, the queue is healthy again.
+
+### Recommended `.env.prod` for hackathon-scale load
+
+```env
+QUEUE_BUFFER_MS=1500
+QUEUE_EARLY_FLUSH_MS=500
+QUEUE_CALLS_PER_MIN_PER_KEY=2
+QUEUE_DEAD_KEY_COOLDOWN_MS=600000
+QUEUE_MAX_RETRIES=3
+```
+
+These values assume a small fleet of free-tier keys under a single GCP project. For real resilience, split keys across projects — see mitigation #1 above.
 
 ---
 
