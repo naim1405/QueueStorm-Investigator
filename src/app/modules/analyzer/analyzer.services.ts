@@ -442,7 +442,7 @@ export const analyzerService = async (body: any): Promise<AnalyzerJobResult> => 
     metadata: body.metadata ?? {},
   };
 
-  const slot = await pickBestKeySlot();
+const slot = await pickBestKeySlot();
 
   let jobId: string;
   try {
