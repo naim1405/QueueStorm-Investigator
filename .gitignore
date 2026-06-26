@@ -8,5 +8,5 @@ secret
 src/generated/prisma
 
 temp
-
 .puku
+note/

@@ -2,6 +2,7 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { generateText } from "ai";
 import { GenerateAITextParams } from "../interface";
 import config from "../config";
+import { analyzerSystemPrompt } from "../app/modules/analyzer/analyzer.services";
 
 const apiKeys = config.geminiApiKeys;
 
@@ -13,8 +14,6 @@ let currentIndex = 0;
 
 const getNextApiKey = (): string => {
   const apiKey = apiKeys[currentIndex];
-
-  console.log(`Using Gemini API key: ${apiKey} and index: ${currentIndex}`);
 
   currentIndex = (currentIndex + 1) % apiKeys.length;
 
@@ -46,9 +45,46 @@ export const generateAIText = async ({
       return text;
     } catch (error) {
       lastError = error;
-      console.error(`Gemini key failed. Trying next key...`);
     }
   }
 
   throw lastError;
+};
+
+export type GenerateAIBatchParams = {
+  apiKey: string;
+  inputs: Record<string, unknown>[];
+};
+
+export const generateAIBatch = async ({
+  apiKey,
+  inputs,
+}: GenerateAIBatchParams): Promise<unknown[]> => {
+  if (inputs.length === 0) return [];
+
+  const googleAI = createGoogleGenerativeAI({ apiKey });
+
+  const { text } = await generateText({
+    model: googleAI("gemini-2.5-flash"),
+    system: analyzerSystemPrompt,
+    prompt: JSON.stringify({ INPUTS: inputs }),
+  });
+
+  // Strip accidental markdown fences.
+  const cleaned = text.replace(/```json|```/g, "").trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new Error(
+      `AI batch returned non-JSON: ${(err as Error).message}; head=${cleaned.slice(0, 200)}`,
+    );
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error(`AI batch returned non-array response`);
+  }
+
+  return parsed;
 };

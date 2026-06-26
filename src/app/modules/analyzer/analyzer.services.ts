@@ -1,6 +1,14 @@
-import { generateAIText } from "../../../lib/ai";
+import {
+  enqueueAnalyzerJob,
+  waitForAnalyzerJob,
+  getQueueDepth,
+  AnalyzerJobResult,
+} from "../../../queue/analyzerQueue";
+import { pickSlotByQueueDepth } from "../../../queue/keys";
+import config from "../../../config";
+import ApiError from "../../../errors/ApiError";
 
-const systemPrompt = `
+export const analyzerSystemPrompt = `
 You are a Fintech Support Copilot and Ticket Investigation Engine.
 
 Your job is to analyze a customer complaint together with the customer's recent transaction history and return ONLY a valid JSON object.
@@ -327,9 +335,43 @@ Examples:
 "fraud_escalation"
 ]
 
+BATCH MODE (MANDATORY)
+
+You will receive an object of the shape:
+{
+"INPUTS": [
+{ ticket_id: "T1", ... },
+{ ticket_id: "T2", ... },
+...N items, in strict input order
+]
+}
+
+You MUST return a single JSON ARRAY of exactly N response objects.
+
+Hard constraints:
+
+1. The outer wrapper MUST be a JSON array. Never wrap in an object.
+2. Length MUST equal N exactly. Do not drop. Do not duplicate. Do not invent.
+3. Each response object corresponds positionally to the same INPUTS index.
+   responses[0] is for INPUTS[0], responses[1] is for INPUTS[1], and so on.
+4. Each response object MUST echo the exact ticket_id from its corresponding input.
+   Do not modify, truncate, or invent ticket_id values.
+5. Do not reorder. The output order MUST match the input order.
+6. If you cannot confidently process a particular input, still return a response
+   object at that index with:
+   {"ticket_id":"<echoed>","relevant_transaction_id":null,
+    "evidence_verdict":"insufficient_data","case_type":"other",
+    "severity":"low","department":"customer_support",
+    "agent_summary":"Unable to analyze ticket.","recommended_next_action":"Manual review.",
+    "customer_reply":"Your case will be reviewed by our team.",
+    "human_review_required":true,"confidence":0,"reason_codes":["insufficient_data"]}
+7. No prose. No markdown. No commentary. No code fences.
+   The entire response must be parseable as a single JSON array.
+8. Never return explanations before or after the array.
+
 FINAL RULES
 
-Return ONLY valid JSON.
+Return ONLY valid JSON (a JSON array in batch mode).
 Do not return markdown.
 Do not return explanations.
 Do not return reasoning.
@@ -341,33 +383,8 @@ If evidence is unclear, use "insufficient_data".
 Never guess financial outcomes.
 `;
 
-
-export const analyzerService = async (body: any) => {
-  const requestMessage = {
-    ticket_id: body.ticket_id,
-    complaint: body.complaint,
-    language: body.language,
-    channel: body.channel,
-    user_type: body.user_type,
-    campaign_context: body.campaign_context,
-    transaction_history: body.transaction_history ?? [],
-    metadata: body.metadata ?? {},
-  };
-//   console.log("LLMResponse:", requestMessage);
-
-  const LLMResponse = await generateAIText({
-    system: systemPrompt,
-    prompt: JSON.stringify(requestMessage),
-  });
-
-//   console.log("LLMResponse:", LLMResponse);
-
-  const decodedResponse = JSON.parse(
-  LLMResponse.replace(/```json|```/g, "").trim()
-);
-
-//   const decodedResponse = JSON.parse(LLMResponse);
-
+const validateAnalyzerResult = (raw: unknown): AnalyzerJobResult => {
+  const r = raw as Record<string, unknown>;
   const {
     ticket_id,
     relevant_transaction_id,
@@ -381,7 +398,7 @@ export const analyzerService = async (body: any) => {
     human_review_required,
     confidence,
     reason_codes,
-  } = decodedResponse;
+  } = r;
 
   if (
     !ticket_id ||
@@ -399,17 +416,62 @@ export const analyzerService = async (body: any) => {
   }
 
   return {
-    ticket_id,
-    relevant_transaction_id,
-    evidence_verdict,
-    case_type,
-    severity,
-    department,
-    agent_summary,
-    recommended_next_action,
-    customer_reply,
-    human_review_required,
-    confidence,
-    reason_codes: Array.isArray(reason_codes) ? reason_codes : [],
+    ticket_id: ticket_id as string,
+    relevant_transaction_id: (relevant_transaction_id ?? null) as string | null,
+    evidence_verdict: evidence_verdict as string,
+    case_type: case_type as string,
+    severity: severity as string,
+    department: department as string,
+    agent_summary: agent_summary as string,
+    recommended_next_action: recommended_next_action as string,
+    customer_reply: customer_reply as string,
+    human_review_required: human_review_required as boolean,
+    confidence: confidence as number,
+    reason_codes: Array.isArray(reason_codes) ? (reason_codes as string[]) : [],
   };
+};
+
+export const analyzerService = async (body: any): Promise<AnalyzerJobResult> => {
+  const requestMessage = {
+    ticket_id: body.ticket_id,
+    complaint: body.complaint,
+    language: body.language,
+    channel: body.channel,
+    user_type: body.user_type,
+    campaign_context: body.campaign_context,
+    transaction_history: body.transaction_history ?? [],
+    metadata: body.metadata ?? {},
+  };
+
+  const slot = await pickSlotByQueueDepth(getQueueDepth);
+
+  let jobId: string;
+  try {
+    await enqueueAnalyzerJob(slot, {
+      ticketId: body.ticket_id,
+      payload: requestMessage,
+    });
+    jobId = body.ticket_id;
+  } catch (err) {
+    const code = (err as Error & { statusCode?: number }).statusCode;
+    if (code === 503) {
+      throw new ApiError(503, "Analyzer queue at capacity. Retry shortly.");
+    }
+    throw err;
+  }
+
+  const timeoutMs =
+    config.queue.bufferMs +
+    config.queue.earlyFlushMs +
+    30_000; // buffer + AI call + safety margin
+
+  try {
+    const result = await waitForAnalyzerJob(slot, jobId, timeoutMs);
+    return validateAnalyzerResult(result);
+  } catch (err) {
+    throw new ApiError(
+      502,
+      `AI batch failed: ${(err as Error).message ?? "unknown error"}`,
+    );
+  }
 };

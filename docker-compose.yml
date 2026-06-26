@@ -1,18 +1,13 @@
 services:
-  server:
-    container_name: server
-    image: server
-    build:
-      context: ./
-      dockerfile: Dockerfile
-    env_file:
-      - ./.env
+  redis:
+    container_name: redis
+    image: redis:7-alpine
     ports:
-      - "5000:5000"
+      - "6379:6379"
     volumes:
-      - app_log:/app/logs
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
     restart: unless-stopped
 
-
 volumes:
-  app_log:
+  redis_data:
