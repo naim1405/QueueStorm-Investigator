@@ -2,11 +2,18 @@ import { Server } from 'http';
 import app from './app';
 import config from './config';
 import logger from './helpers/logger';
+import { startAnalyzerWorkers, closeAnalyzerWorkers } from './queue/analyzerWorker';
+import { closeAllQueues } from './queue/analyzerQueue';
+import { closeRedisConnection } from './lib/redis';
 
 let server: Server;
 
 async function bootstrap() {
   try {
+    // Start queue workers BEFORE accepting HTTP so jobs that arrive immediately can be buffered.
+    startAnalyzerWorkers();
+    logger.info('Analyzer workers started');
+
     server = app.listen(config.port, () => {
       const address = server.address();
       const port =
@@ -29,28 +36,30 @@ async function bootstrap() {
 async function gracefulShutdown(signal: string) {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
-  if (server) {
-    server.close(async () => {
+  try {
+    if (server) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       logger.info('HTTP server closed');
-      try {
-        logger.info('Graceful shutdown completed');
-        process.exit(0);
-      } catch (error) {
-        logger.error('Graceful shutdown failed while disconnecting DB', {
-          error,
-        });
-        process.exit(1);
-      }
-    });
-
-    // Force close after 30 seconds
-    setTimeout(() => {
-      logger.error(
-        'Could not close connections in time, forcefully shutting down'
-      );
-      process.exit(1);
-    }, 30_000);
+    }
+    await closeAnalyzerWorkers();
+    logger.info('Analyzer workers closed');
+    await closeAllQueues();
+    logger.info('Queues closed');
+    await closeRedisConnection();
+    logger.info('Redis connection closed');
+    process.exit(0);
+  } catch (error) {
+    logger.error('Graceful shutdown failed', { error });
+    process.exit(1);
   }
+
+  // Force close after 30 seconds
+  setTimeout(() => {
+    logger.error(
+      'Could not close connections in time, forcefully shutting down'
+    );
+    process.exit(1);
+  }, 30_000).unref();
 }
 
 // Error handlers

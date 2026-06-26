@@ -1,9 +1,8 @@
 import express from 'express';
+import { analyzeTicket } from './analyzer.controllers';
 
 const router = express.Router();
 
-router.post('', (_, res) => {
-  res.send('Analyzing ticket...');
-});
+router.post('/', analyzeTicket);
 
 export const analyzerRoutes = router;
