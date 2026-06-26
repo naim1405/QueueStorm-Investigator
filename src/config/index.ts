@@ -11,4 +11,5 @@ dotenv.config({ path: envPath });
 export default {
   env: process.env['NODE_ENV'],
   port: process.env['PORT'],
+  GEMINI_API_KEY: process.env['GEMINI_API_KEY']
 };

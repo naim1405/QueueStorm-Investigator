@@ -22,3 +22,8 @@ export type IApiErrorResponse = {
   message: string;
   errorMessages: IApiErrorMessage[];
 };
+
+export type GenerateAITextParams = {
+  system: string;
+  prompt: string;
+};
