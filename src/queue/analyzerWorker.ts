@@ -1,6 +1,11 @@
 import config from "../config";
 import { getRedisConnection } from "../lib/redis";
-import { getKeySlots, KeySlot } from "./keys";
+import {
+  getKeySlots,
+  KeySlot,
+  markKeyDead,
+  recordKeyCall,
+} from "./keys";
 import { generateAIBatch } from "../lib/ai";
 import {
   AnalyzerJobResult,
@@ -106,10 +111,23 @@ const runBatchForSlot = async (state: SlotState): Promise<void> => {
       throw new Error("Batch response is not an array");
     }
     responses = result;
+    // Successful call — record against per-key rate counter.
+    await recordKeyCall(state.slot);
   } catch (err) {
+    // Every attempted call counts against the per-key rate budget,
+    // regardless of outcome — Gemini still charges the slot.
+    await recordKeyCall(state.slot);
+    const msg = (err as Error).message;
+    // "denied access" / project banned => permanent for this key.
+    if (/denied access|project has been|api key not valid|invalid api key/i.test(msg)) {
+      await markKeyDead(state.slot);
+      // eslint-disable-next-line no-console
+      console.error(
+        `[worker ${state.slot.queueName}] marking key dead (denied): ${msg}`,
+      );
+    }
     // Re-queue and fail each ticket so waiters unblock.
     await requeueJobs(state.slot, jobs);
-    const msg = (err as Error).message;
     await Promise.all(
       jobs.map((j) => publishFailure(state.slot, j.ticketId, msg)),
     );

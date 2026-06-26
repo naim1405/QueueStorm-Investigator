@@ -1,10 +1,9 @@
 import {
   enqueueAnalyzerJob,
   waitForAnalyzerJob,
-  getQueueDepth,
   AnalyzerJobResult,
 } from "../../../queue/analyzerQueue";
-import { pickSlotByQueueDepth } from "../../../queue/keys";
+import { pickBestKeySlot } from "../../../queue/keys";
 import config from "../../../config";
 import ApiError from "../../../errors/ApiError";
 
@@ -443,7 +442,7 @@ export const analyzerService = async (body: any): Promise<AnalyzerJobResult> => 
     metadata: body.metadata ?? {},
   };
 
-  const slot = await pickSlotByQueueDepth(getQueueDepth);
+  const slot = await pickBestKeySlot();
 
   let jobId: string;
   try {
